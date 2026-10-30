@@ -3,7 +3,7 @@ use std::{collections::HashSet, path::Path};
 use anyhow::Result;
 use futures::{future::BoxFuture, FutureExt};
 use log::{debug, info};
-use spin_app::{locked::LockedApp, App};
+use spin_app::{locked::LockedApp, locked::LockedTrigger, App};
 use spin_runtime_factors::{FactorsBuilder, TriggerAppArgs, TriggerFactors};
 use spin_trigger::{
     cli::{FactorsConfig, TriggerAppBuilder, UserProvidedPath},
@@ -106,4 +106,119 @@ pub(crate) fn get_supported_triggers(locked_app: &LockedApp) -> anyhow::Result<H
             }
         })
         .collect::<anyhow::Result<HashSet<_>>>()
+}
+
+/// Log non-HTTP trigger configuration to stdout at startup.
+///
+/// The HTTP trigger already prints its listen address and routes; this prints
+/// summary lines for the other supported trigger types in the same style.
+pub(crate) fn log_triggers_at_startup(locked_app: &LockedApp) {
+    for line in format_non_http_trigger_lines(locked_app) {
+        println!("{line}");
+    }
+}
+
+fn format_non_http_trigger_lines(locked_app: &LockedApp) -> Vec<String> {
+    let non_http_triggers: Vec<_> = locked_app
+        .triggers
+        .iter()
+        .filter(|trigger| trigger.trigger_type.as_str() != HTTP_TRIGGER_TYPE)
+        .collect();
+
+    if non_http_triggers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec!["Available Triggers:".to_string()];
+    for trigger in non_http_triggers {
+        lines.push(format_trigger_line(trigger));
+    }
+    lines
+}
+
+fn format_trigger_line(trigger: &LockedTrigger) -> String {
+    let config = &trigger.trigger_config;
+    if let Some(component) = config.get("component").and_then(|value| value.as_str()) {
+        return match trigger.trigger_type.as_str() {
+            MQTT_TRIGGER_TYPE => {
+                let topic = config_field(config, "topic");
+                format!("  {component}: mqtt topic {topic}")
+            }
+            REDIS_TRIGGER_TYPE => {
+                let channel = config_field(config, "channel");
+                let address = config
+                    .get("address")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("(from application trigger config)");
+                format!("  {component}: redis channel {channel} @ {address}")
+            }
+            SQS_TRIGGER_TYPE => {
+                let queue_url = config_field(config, "queue_url");
+                format!("  {component}: sqs queue {queue_url}")
+            }
+            COMMAND_TRIGGER_TYPE => format!("  {component}: command trigger"),
+            other => format!("  {component}: {other} trigger ({})", trigger.id),
+        };
+    }
+
+    match trigger.trigger_type.as_str() {
+        MQTT_TRIGGER_TYPE if config.get("address").is_some() => {
+            let address = config_field(config, "address");
+            format!("  mqtt broker: {address}")
+        }
+        other => format!("  {} ({}): {}", trigger.id, other, config),
+    }
+}
+
+fn config_field<'a>(config: &'a serde_json::Value, field: &str) -> &'a str {
+    config
+        .get(field)
+        .and_then(|value| value.as_str())
+        .unwrap_or("-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_supported_triggers_rejects_unknown_type() {
+        let app_json = r#"{
+            "spin_lock_version": 1,
+            "triggers": [{ "id": "x", "trigger_type": "cron", "trigger_config": {} }],
+            "components": []
+        }"#;
+        let locked_app = LockedApp::from_json(app_json.as_bytes()).unwrap();
+        assert!(get_supported_triggers(&locked_app).is_err());
+    }
+
+    #[test]
+    fn log_triggers_at_startup_includes_non_http_triggers_only() {
+        let app_json = r#"{
+            "spin_lock_version": 1,
+            "triggers": [
+                {
+                    "id": "http",
+                    "trigger_type": "http",
+                    "trigger_config": { "component": "web", "route": "/api" }
+                },
+                {
+                    "id": "mqtt-1",
+                    "trigger_type": "mqtt",
+                    "trigger_config": { "component": "logger", "topic": "events", "qos": "1" }
+                }
+            ],
+            "components": []
+        }"#;
+        let locked_app = LockedApp::from_json(app_json.as_bytes()).unwrap();
+
+        let lines = format_non_http_trigger_lines(&locked_app);
+
+        assert_eq!(lines[0], "Available Triggers:");
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("logger: mqtt topic events")));
+        assert!(!lines.iter().any(|line| line.contains("web")));
+        assert!(!lines.iter().any(|line| line.contains("/api")));
+    }
 }
